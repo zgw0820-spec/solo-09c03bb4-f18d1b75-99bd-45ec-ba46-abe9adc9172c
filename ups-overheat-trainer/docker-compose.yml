@@ -1,0 +1,8 @@
+services:
+  ups-trainer:
+    build: .
+    image: ups-overheat-trainer:latest
+    container_name: ups-overheat-trainer
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

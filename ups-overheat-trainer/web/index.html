@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>UPS 过热预警 · 逻辑回归训练页</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --line: #334155;
+    --text: #e2e8f0; --muted: #94a3b8;
+    --blue: #38bdf8; --green: #4ade80; --amber: #fbbf24;
+    --red: #f87171; --purple: #c084fc;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 14px; color: var(--blue); }
+  label { display: block; font-size: 13px; margin: 10px 0 4px; color: var(--muted); }
+  input[type=number] {
+    width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  }
+  .row { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+  .row label { margin: 0; color: var(--text); }
+  button {
+    width: 100%; margin-top: 16px; padding: 10px; border: 0; border-radius: 8px;
+    background: var(--blue); color: #082f49; font-weight: 700;
+    cursor: pointer; font-size: 14px;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.secondary { background: var(--green); color: #052e16; }
+  .stat { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .card {
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .card .k { font-size: 12px; color: var(--muted); }
+  .card .v { font-size: 18px; font-weight: 700; margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 7px 8px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 12px; white-space: nowrap;
+  }
+  .b-pending    { background: #334155; color: #cbd5e1; }
+  .b-training   { background: #1d4ed8; color: #dbeafe; }
+  .b-validating { background: #7e22ce; color: #f3e8ff; }
+  .b-returned   { background: #a16207; color: #fef9c3; }
+  .b-judged     { background: #166534; color: #dcfce7; }
+  .b-ignored, .b-cancelled { background: #7f1d1d; color: #fee2e2; }
+  tr.best td { background: rgba(74, 222, 128, .08); }
+  .note { color: var(--muted); font-size: 12px; }
+  .status-pill { font-size: 13px; padding: 4px 12px; border-radius: 999px; }
+  .s-running { background: #1e3a8a; color: #bfdbfe; }
+  .s-early_stopped { background: #78350f; color: #fde68a; }
+  .s-completed { background: #14532d; color: #bbf7d0; }
+  .s-failed { background: #7f1d1d; color: #fecaca; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 14px; }
+  .legend span { font-size: 12px; color: var(--muted); }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .table-wrap { max-height: 520px; overflow: auto; }
+  code { color: var(--amber); }
+</style>
+</head>
+<body>
+  <h1>UPS 过热预警模型 · 逻辑回归训练页</h1>
+  <div class="sub">
+    FastAPI + NumPy · 全批量梯度下降 · 验证异步乱序返回、按轮号判定、连续 2 轮未刷新最低损失即早停 ·
+    在途（已发起未判定）轮次上限 <code>3</code>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="panel">
+        <h2>训练参数</h2>
+        <div id="dsInfo" class="note">样本信息加载中…</div>
+        <label for="maxEpochs">训练轮数上限（max_epochs）</label>
+        <input id="maxEpochs" type="number" min="1" max="100" value="15" />
+        <label for="valDelay">各轮验证延迟基线（秒）</label>
+        <input id="valDelay" type="number" min="0" max="30" step="0.1" value="0.6" />
+        <div class="row">
+          <input id="jitter" type="checkbox" checked />
+          <label for="jitter">延迟加随机抖动（制造乱序返回）</label>
+        </div>
+        <label for="lr">学习率（训练集含误标注，偏大时验证损失会反弹，便于演示早停）</label>
+        <input id="lr" type="number" min="0.01" max="20" step="0.05" value="1.1" />
+        <button id="startBtn">开始训练</button>
+        <div id="err" class="err"></div>
+      </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h2>训练结论</h2>
+        <div class="stat">
+          <div class="card"><div class="k">状态</div><div class="v" id="stStatus">-</div></div>
+          <div class="card"><div class="k">最低损失轮（并列取最早）</div><div class="v" id="stBest">-</div></div>
+          <div class="card"><div class="k">最低验证损失</div><div class="v" id="stLoss">-</div></div>
+          <div class="card"><div class="k">该轮验证准确率</div><div class="v" id="stAcc">-</div></div>
+          <div class="card"><div class="k">在途峰值 / 上限</div><div class="v" id="stPeak">-</div></div>
+          <div class="card"><div class="k">连续未刷新</div><div class="v" id="stStale">-</div></div>
+        </div>
+        <div id="reason" class="note"></div>
+        <button id="dlBtn" class="secondary" disabled>下载最低损失轮权重 (.npz)</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>训练与验证进度</h2>
+      <div class="legend">
+        <span><span class="badge b-pending">待训练</span></span>
+        <span><span class="badge b-training">训练中</span></span>
+        <span><span class="badge b-validating">验证在途</span></span>
+        <span><span class="badge b-returned">已返回待判定</span></span>
+        <span><span class="badge b-judged">已判定</span></span>
+        <span><span class="badge b-ignored">忽略/取消</span></span>
+        <span class="note">（乱序时可看到后轮先变“已返回”，但仍等前轮判定）</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>轮号</th><th>状态</th><th class="num">训练损失</th>
+              <th class="num">验证损失</th><th>说明</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"><tr><td colspan="5" class="note">尚未开始训练</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sessionId = null, timer = null;
+
+const STATE_LABEL = {
+  pending: "待训练", training: "训练中", validating: "验证在途",
+  returned: "已返回待判定", judged: "已判定",
+  ignored: "忽略", cancelled: "已取消",
+};
+const fmt = (x, d = 4) => (x === null || x === undefined) ? "-" : Number(x).toFixed(d);
+
+async function loadDataset() {
+  try {
+    const r = await fetch("/api/dataset");
+    const d = await r.json();
+    $("dsInfo").innerHTML =
+      `内置样本：训练集 <b>${d.n_train}</b>（过热 ${d.train_positive}，含 ${d.n_flipped} 条误标注）· ` +
+      `验证集 <b>${d.n_val}</b>（过热 ${d.val_positive}，标签干净）· ${d.feature_names.length} 个特征`;
+  } catch (e) {
+    $("dsInfo").textContent = "样本信息加载失败：" + e;
+  }
+}
+
+function render(s) {
+  $("stStatus").innerHTML =
+    `<span class="status-pill s-${s.status}">${
+      {running:"训练中", early_stopped:"已早停", completed:"已跑完", failed:"失败"}[s.status] || s.status
+    }</span>`;
+  $("stBest").textContent = s.best_epoch ?? "-";
+  $("stLoss").textContent = fmt(s.best_val_loss);
+  $("stAcc").textContent = s.best_accuracy != null ? (s.best_accuracy * 100).toFixed(1) + "%" : "-";
+  $("stPeak").textContent = `${s.peak_in_flight} / 3`;
+  $("stStale").textContent = `${s.stale_streak} / 2`;
+  $("reason").textContent = s.stop_reason || (s.error ? "错误：" + s.error : "");
+
+  const rows = s.epochs.map(e => `
+    <tr class="${s.best_epoch === e.epoch ? "best" : ""}">
+      <td>${e.epoch}${s.best_epoch === e.epoch ? " ⭐" : ""}</td>
+      <td><span class="badge b-${e.state}">${STATE_LABEL[e.state] || e.state}</span></td>
+      <td class="num">${fmt(e.train_loss)}</td>
+      <td class="num">${fmt(e.val_loss)}</td>
+      <td class="note">${e.note || ""}</td>
+    </tr>`).join("");
+  $("tbody").innerHTML = rows || '<tr><td colspan="5" class="note">暂无轮次</td></tr>';
+
+  const terminalStates = ["judged", "ignored", "cancelled"];
+  const allSettled = s.epochs.every(e => terminalStates.includes(e.state));
+  const statusDone = ["early_stopped", "completed", "failed"].includes(s.status);
+  const done = statusDone && allSettled;
+  $("startBtn").disabled = s.status === "running";
+  // 权重在判定时已保存，状态一结束即可下载，不必等在途任务收尾
+  $("dlBtn").disabled = !(statusDone && s.best_epoch != null);
+  if (done && timer) { clearInterval(timer); timer = null; }
+}
+
+async function poll() {
+  if (!sessionId) return;
+  try {
+    const r = await fetch(`/api/sessions/${sessionId}`);
+    if (!r.ok) throw new Error(await r.text());
+    render(await r.json());
+  } catch (e) {
+    $("err").textContent = "进度查询失败：" + e.message;
+  }
+}
+
+$("startBtn").onclick = async () => {
+  $("err").textContent = "";
+  const body = {
+    max_epochs: parseInt($("maxEpochs").value, 10),
+    val_delay: parseFloat($("valDelay").value),
+    jitter: $("jitter").checked,
+    lr: parseFloat($("lr").value),
+  };
+  try {
+    const r = await fetch("/api/train", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || r.status);
+    sessionId = data.session_id;
+    $("startBtn").disabled = true;
+    $("dlBtn").disabled = true;
+    render(data);
+    if (timer) clearInterval(timer);
+    timer = setInterval(poll, 400);
+  } catch (e) {
+    $("err").textContent = "启动失败：" + e.message;
+  }
+};
+
+$("dlBtn").onclick = () => {
+  if (sessionId) window.open(`/api/sessions/${sessionId}/weights`, "_blank");
+};
+
+loadDataset();
+</script>
+</body>
+</html>
