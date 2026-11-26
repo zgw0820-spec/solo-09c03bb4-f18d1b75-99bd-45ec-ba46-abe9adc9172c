@@ -38,6 +38,8 @@ class StartRequest(BaseModel):
     jitter: bool = True
     lr: float = Field(default=model.DEFAULT_LR, gt=0.0, le=20.0)
     seed: int = Field(default=42, ge=0, le=10_000_000)
+    # 指定一轮模拟验证报错（0/省略表示不模拟）
+    simulate_error_epoch: Optional[int] = Field(default=None, ge=1, le=100)
 
 
 @app.get("/api/dataset")
@@ -67,6 +69,17 @@ async def start_training(req: StartRequest):
             status_code=409,
             detail=f"训练 {active.id} 仍在进行中，请等待结束后再发起",
         )
+    if (
+        req.simulate_error_epoch is not None
+        and req.simulate_error_epoch > req.max_epochs
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"模拟报错轮号 {req.simulate_error_epoch} 超出训练轮数上限 "
+                f"{req.max_epochs}"
+            ),
+        )
 
     cfg = engine.TrainConfig(
         max_epochs=req.max_epochs,
@@ -74,6 +87,7 @@ async def start_training(req: StartRequest):
         jitter=req.jitter,
         lr=req.lr,
         seed=req.seed,
+        simulate_error_epoch=req.simulate_error_epoch,
     )
     session = engine.new_session(cfg, DATASET)
     SESSIONS[session.id] = session
@@ -105,6 +119,15 @@ async def download_weights(session_id: str):
     if session.status == "running":
         raise HTTPException(
             status_code=409, detail="训练尚未结束，无法下载权重"
+        )
+    if session.status == "failed":
+        # 失败即作废：即使此前已有最佳轮，也拒绝提供本次权重
+        epoch_text = (
+            f"第 {session.failed_epoch} 轮" if session.failed_epoch else "某轮"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"训练因{epoch_text}验证报错而失败，不提供本次权重",
         )
     if session.best_weights is None:
         raise HTTPException(status_code=409, detail="尚无有效判定轮次")

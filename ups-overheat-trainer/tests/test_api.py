@@ -87,8 +87,8 @@ class ApiTests(unittest.TestCase):
         final = None
         deadline = time.time() + 60
         valid_states = {
-            "pending", "training", "validating", "returned",
-            "judged", "ignored", "cancelled",
+            "pending", "training", "validating", "returned", "error_returned",
+            "judged", "failed", "ignored", "cancelled",
         }
         while time.time() < deadline:
             _, snap = self._get(f"/api/sessions/{sid}")
@@ -120,6 +120,99 @@ class ApiTests(unittest.TestCase):
             float(bundle["best_val_loss"]), final["best_val_loss"], places=10
         )
         self.assertEqual(str(bundle["status"]), final["status"])
+
+    def test_simulated_error_fails_epoch_and_blocks_download(self):
+        """指定轮报错：页面可见失败轮号，接口拒绝权重，即使此前已有最佳轮。"""
+        # lr=1.1 时第 1 轮即可刷新最低损失（此前有最佳轮）；第 3 轮模拟报错
+        _, created = self._post(
+            "/api/train",
+            {
+                "max_epochs": 12, "val_delay": 0.15, "jitter": True,
+                "lr": 1.1, "simulate_error_epoch": 3,
+            },
+        )
+        sid = created["session_id"]
+        self.assertEqual(created["simulate_error_epoch"], 3)
+        final = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            _, snap = self._get(f"/api/sessions/{sid}")
+            final = snap
+            if snap["status"] in ("early_stopped", "completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["failed_epoch"], 3)
+        # 失败前已判定出最佳轮（lr=1.1 时第 2 轮），权重仍在内存，但接口拒绝提供
+        self.assertIsNotNone(final["best_epoch"])
+        self.assertLess(final["best_epoch"], final["failed_epoch"])
+        self.assertIn("第 3 轮", final["error"])
+        ep3 = final["epochs"][2]
+        self.assertEqual(ep3["state"], "failed")
+        self.assertIn("验证报错", ep3["error"])
+        # 失败轮之后的在途轮次只能是 ignored/cancelled
+        for ep in final["epochs"][3:]:
+            self.assertIn(ep["state"], ("ignored", "cancelled"))
+        # 报错之前已判定的轮次保留结论
+        self.assertEqual(final["epochs"][0]["state"], "judged")
+
+        # 接口拒绝提供本次权重（即使 best_epoch 存在）
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/api/sessions/{sid}/weights",
+                timeout=10,
+            )
+            self.fail("训练失败后下载权重应被拒绝")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 409)
+            detail = json.loads(e.read())["detail"]
+            self.assertIn("第 3 轮", detail)
+            self.assertIn("失败", detail)
+
+    def test_early_stop_then_late_error_still_downloadable(self):
+        """早停结论先固化：之后第 6 轮报错返回也不改结论，权重仍可下载。"""
+        _, created = self._post(
+            "/api/train",
+            {
+                "max_epochs": 12, "val_delay": 0.3, "jitter": False,
+                "lr": 1.1, "simulate_error_epoch": 9,
+            },
+        )
+        sid = created["session_id"]
+        final = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            _, snap = self._get(f"/api/sessions/{sid}")
+            final = snap
+            if snap["status"] in ("early_stopped", "completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(final["status"], "early_stopped")  # 真实样本 lr=1.1 第 7 轮早停
+        self.assertIsNone(final["failed_epoch"])
+        self.assertIsNotNone(final["best_epoch"])
+        # 早停触发后返回的第 9 轮报错应被忽略，不得改成失败
+        self.assertEqual(final["epochs"][8]["state"], "ignored")
+        self.assertIn("早停", final["epochs"][8]["note"])
+
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}/api/sessions/{sid}/weights", timeout=10
+        ) as r:
+            self.assertEqual(r.status, 200)
+            data = r.read()
+        bundle = np.load(__import__("io").BytesIO(data), allow_pickle=True)
+        self.assertEqual(str(bundle["status"]), "early_stopped")
+        self.assertEqual(int(bundle["best_epoch"]), final["best_epoch"])
+
+    def test_simulate_error_epoch_out_of_range_rejected(self):
+        """模拟报错轮号超过训练轮数上限：直接 422，不创建会话。"""
+        status, body = self._post(
+            "/api/train",
+            {"max_epochs": 4, "val_delay": 0.0, "simulate_error_epoch": 9},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("超出", body["detail"])
 
     def test_running_weights_download_rejected(self):
         _, created = self._post(

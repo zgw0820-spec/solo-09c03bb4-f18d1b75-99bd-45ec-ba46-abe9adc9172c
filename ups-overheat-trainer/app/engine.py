@@ -1,18 +1,25 @@
 """异步训练引擎。
 
-并发与早停规则（与需求一一对应）：
+并发、乱序与“结果/报错统一按轮号判定”规则（与需求一一对应）：
 
 1. 每轮训练完成后，用当时的权重快照异步计算验证集损失；
-2. 验证协程带随机延迟，结果允许乱序返回；
+2. 验证协程带随机延迟，结果允许乱序返回；任一轮的验证报错也视为该轮的
+   一种返回值，与验证结果一起按轮号排队判定；
 3. 已发起训练但尚未判定的轮次最多 3 个（信号量控位，有空位才发起新一轮）；
-4. 判定严格按轮号顺序：轮 N 未判定前，轮 N+1 即使先返回也保持 returned；
-5. 连续两轮验证损失未刷新历史最低，立即停止发起新一轮，触发轮之后的
-   在途结果一律忽略（ignored）；
-6. 早停或跑满最后一轮后，输出判定范围内损失最低的那轮权重（并列取最早轮）。
+4. 判定严格按轮号顺序：轮 N 未判定前，轮 N+1 即使先返回（结果或报错）也
+   只保持 returned / failed，不参与结论；
+5. 若先判到“连续两轮未刷新最低损失”（早停），立即确定结论并保留最佳轮
+   权重；触发轮之后的结果与报错无论何时返回，一律忽略（ignored），不得
+   改变结论或权重；
+6. 若先判到某一轮验证报错，本次训练立即失败（failed），不再发起新轮次；
+   该轮之后的在途结果/报错一律忽略；即使此前已有最佳轮，接口也拒绝下载；
+7. 正常结束（早停或跑满最后一轮）后，输出判定范围内损失最低的那轮权重
+   （并列取最早轮）。
 
-实现要点：用 asyncio.TaskGroup 做结构化并发；信号量在生产者发起轮次前
-acquire、在 judge 判定（或忽略）该轮后 release，因此信号量计数恒等于
-“已发起但未判定”的轮次数，从结构上保证不超过 3，而非依赖时序。
+实现要点：用 asyncio.TaskGroup 做结构化并发；单轮任务内部捕获验证/训练
+异常并记为该轮的错误返回值，因此后轮的报错不会拖垮前轮的判定。信号量在
+生产者发起轮次前 acquire、在 judge 判定/忽略该轮后 release，因此信号量
+计数恒等于“已发起但未判定”的轮次数，从结构上保证不超过 3，而非依赖时序。
 """
 
 from __future__ import annotations
@@ -34,10 +41,12 @@ PATIENCE = 2  # 连续两轮未刷新最低损失即早停
 PENDING = "pending"        # 尚未开始训练
 TRAINING = "training"      # 训练中
 VALIDATING = "validating"  # 训练完，验证协程在途
-RETURNED = "returned"      # 验证已返回，等待按轮号判定
+RETURNED = "returned"      # 验证结果已返回，等待按轮号判定
+ERROR_RETURNED = "error_returned"  # 验证报错已返回，等待按轮号判定
 JUDGED = "judged"          # 已判定（有效结果）
-IGNORED = "ignored"        # 早停触发后被忽略的结果
-CANCELLED = "cancelled"    # 早停时未完成的在途任务 / 未发起轮次
+FAILED = "failed"          # 该轮报错被判定：本次训练失败
+IGNORED = "ignored"        # 早停/失败触发后被忽略的结果或报错
+CANCELLED = "cancelled"    # 早停/失败时未发起（或未完成）的轮次
 
 
 @dataclass
@@ -46,6 +55,7 @@ class EpochRecord:
     state: str = PENDING
     train_loss: Optional[float] = None
     val_loss: Optional[float] = None
+    error: str = ""
     started_at: Optional[float] = None
     returned_at: Optional[float] = None
     judged_at: Optional[float] = None
@@ -59,6 +69,8 @@ class TrainConfig:
     jitter: bool = True       # 是否在延迟上加随机抖动（产生乱序）
     lr: float = model.DEFAULT_LR
     seed: int = 42
+    # 模拟指定轮次的验证报错（None 表示不模拟）；规则与真实报错完全一致
+    simulate_error_epoch: Optional[int] = None
 
 
 @dataclass
@@ -72,6 +84,7 @@ class TrainSession:
     best_val_loss: Optional[float] = None
     best_weights: Optional[np.ndarray] = None
     best_accuracy: Optional[float] = None
+    failed_epoch: Optional[int] = None  # 因验证报错而失败时，首个报错轮号
     stop_reason: str = ""
     error: str = ""
     created_at: float = field(default_factory=time.time)
@@ -97,9 +110,11 @@ class TrainSession:
             "val_delay": self.config.val_delay,
             "jitter": self.config.jitter,
             "lr": self.config.lr,
+            "simulate_error_epoch": self.config.simulate_error_epoch,
             "best_epoch": self.best_epoch,
             "best_val_loss": self.best_val_loss,
             "best_accuracy": self.best_accuracy,
+            "failed_epoch": self.failed_epoch,
             "stop_reason": self.stop_reason,
             "error": self.error,
             "stale_streak": self.stale_streak,
@@ -114,6 +129,7 @@ class TrainSession:
                     "state": r.state,
                     "train_loss": r.train_loss,
                     "val_loss": r.val_loss,
+                    "error": r.error,
                     "note": r.note,
                 }
                 for r in self.records
@@ -158,35 +174,39 @@ async def run_session(
     async def epoch_task(epoch: int, weights_in: np.ndarray) -> None:
         """单轮：训练一步 -> 快照权重 -> 带延迟异步验证。
 
-        并发位由生产者（run_epochs）统一 acquire，且要等到 judge 判定完
-        该轮（judged/ignored）才释放——信号量计数即“已发起但未判定”的
-        轮次数，因此该数字在结构上恒不超过 MAX_IN_FLIGHT，而非依赖时序。
+        验证报错不再向上抛给 TaskGroup（否则会拖垮整场训练、让先到的后轮
+        报错抢在前面使前轮无法判定），而是记为该轮的“报错返回值”，与验证
+        结果一起等待 judge 按轮号判定。并发位由生产者（run_epochs）统一
+        acquire，且要等到 judge 判定/忽略完该轮才释放——信号量计数即
+        “已发起但未判定”的轮次数，结构上恒不超过 MAX_IN_FLIGHT。
         """
         rec = session.records[epoch - 1]
         rec.state = TRAINING
         rec.started_at = time.time()
-        async with lock:
-            session._in_flight[0] += 1
-            session._peak[0] = max(session._peak[0], session._in_flight[0])
-            # 实时写回，保证状态翻转为早停/完成时峰值已可读取
-            session.peak_in_flight = session._peak[0]
-        weights, train_loss = await loop.run_in_executor(
-            None, model.train_step, weights_in, ds.X_train, ds.y_train, cfg.lr
-        )
-        rec.train_loss = train_loss
-
-        snapshot = weights.copy()
-        session._snapshots[epoch] = snapshot
-        rec.state = VALIDATING
-        async with lock:
-            session._peak[0] = max(session._peak[0], session._in_flight[0])
-            session.peak_in_flight = session._peak[0]
-
         event = asyncio.Event()
         session._events[epoch] = event
         try:
+            async with lock:
+                session._in_flight[0] += 1
+                session._peak[0] = max(session._peak[0], session._in_flight[0])
+                # 实时写回，保证状态翻转为早停/完成时峰值已可读取
+                session.peak_in_flight = session._peak[0]
+            weights, train_loss = await loop.run_in_executor(
+                None, model.train_step, weights_in, ds.X_train, ds.y_train, cfg.lr
+            )
+            rec.train_loss = train_loss
+
+            snapshot = weights.copy()
+            session._snapshots[epoch] = snapshot
+            rec.state = VALIDATING
+            async with lock:
+                session._peak[0] = max(session._peak[0], session._in_flight[0])
+                session.peak_in_flight = session._peak[0]
+
             # 验证延迟：若会话被外部取消，TaskGroup 会在此抛 CancelledError
             await asyncio.sleep(actual_delay(epoch))
+            if cfg.simulate_error_epoch == epoch:
+                raise RuntimeError(f"第 {epoch} 轮验证报错（模拟）")
             val_loss = await loop.run_in_executor(
                 None, model.bce_loss, snapshot, ds.X_val, ds.y_val
             )
@@ -194,13 +214,25 @@ async def run_session(
             rec.val_loss = val_loss
             rec.returned_at = time.time()
             rec.state = RETURNED
-            rec.note = "已返回，等待按轮号判定"
+            rec.note = "验证结果已返回，等待按轮号判定"
+        except asyncio.CancelledError:
+            # 会话级取消（与早停/失败无关）才走这里；通知 judge 后继续向上传播
+            if rec.state not in (RETURNED, ERROR_RETURNED, JUDGED, IGNORED):
+                rec.state = CANCELLED
+                rec.note = "轮次任务被取消"
+            raise
+        except Exception as exc:
+            # 该轮的报错本身就是一种返回值：按轮号排队判定，不立即下结论
+            rec.error = f"{type(exc).__name__}: {exc}"
+            rec.returned_at = time.time()
+            rec.state = ERROR_RETURNED
+            rec.note = f"验证报错已返回，等待按轮号判定：{rec.error}"
         finally:
-            # 无论正常返回还是被取消都发信号；空位由 judge 统一释放
+            # 无论结果、报错还是取消都发信号；空位由 judge 统一释放
             event.set()
 
     async def run_epochs() -> None:
-        """生产者：先占空位再发起轮次；早停后剩余轮次标为取消、不再发起。"""
+        """生产者：先占空位再发起轮次；早停/失败后剩余轮次标为取消、不再发起。"""
         w = model.initial_weights(ds.X_train.shape[1])
         acquire_task: Optional[asyncio.Task] = None
         stop_task = asyncio.create_task(stop_event.wait())
@@ -209,7 +241,7 @@ async def run_session(
                 for rec in session.records:
                     if stop_event.is_set():
                         rec.state = CANCELLED
-                        rec.note = "早停已触发，未发起"
+                        rec.note = "训练已结束，未发起"
                         continue
                     # 空位控制：满 3 个（已发起未判定）时等待；停止事件可抢先唤醒
                     acquire_task = asyncio.create_task(semaphore.acquire())
@@ -223,7 +255,7 @@ async def run_session(
                         else:
                             semaphore.release()
                         rec.state = CANCELLED
-                        rec.note = "早停已触发，未发起"
+                        rec.note = "训练已结束，未发起"
                         continue
                     slot_owned.add(rec.epoch)
                     # 用上一轮结束时的权重发起本轮，任务内部完成本轮梯度更新
@@ -236,17 +268,23 @@ async def run_session(
             stop_task.cancel()
 
     async def judge() -> None:
-        """消费者：严格按轮号判定，连续 PATIENCE 轮未刷新即早停。"""
+        """消费者：严格按轮号判定。
+
+        - 先判到早停：结论立即固化，触发轮之后的结果/报错全部忽略；
+        - 先判到某轮报错：本次训练失败，不再发起新轮次，之后的结果/报错忽略；
+        - 报错与结果同样按轮号排队，先到但轮号靠后的报错不能抢跑。
+        """
         best_epoch: Optional[int] = None
         best_loss = float("inf")
         best_weights: Optional[np.ndarray] = None
         best_acc: Optional[float] = None
         stale = 0
-        stop_trigger_epoch: Optional[int] = None
+        stop_epoch: Optional[int] = None   # 早停触发轮
+        failed_epoch: Optional[int] = None  # 报错失败轮
         judged = 0
 
         async def close_slot(epoch: int) -> None:
-            """轮次进入终态（判定/忽略/取消）时归还空位，每轮恰好一次。"""
+            """轮次进入终态（判定/失败/忽略/取消）时归还空位，每轮恰好一次。"""
             if epoch in slot_owned:
                 slot_owned.discard(epoch)
                 async with lock:
@@ -257,8 +295,9 @@ async def run_session(
             epoch = judged + 1
             rec = session.records[epoch - 1]
 
-            # 早停后未发起的轮次：无事件、无空位，直接跳过
+            # 结论已固化（早停/失败）后剩下的轮次：无事件、无空位，直接跳过
             if rec.state == CANCELLED:
+                await close_slot(epoch)  # 防御性：若该轮曾占位则归还（幂等）
                 judged += 1
                 continue
 
@@ -269,24 +308,47 @@ async def run_session(
                 continue
             await event.wait()
 
-            # 在途任务被 TaskGroup 取消（会话级取消）
-            if rec.state in (IGNORED, CANCELLED):
+            # 结论已固化后，后面的结果/报错无论何时返回都忽略
+            if stop_epoch is not None or failed_epoch is not None:
+                rec.state = IGNORED
+                if failed_epoch is not None:
+                    rec.note = (
+                        f"第 {failed_epoch} 轮验证报错，本次训练失败；"
+                        f"第 {epoch} 轮结果忽略"
+                    )
+                else:
+                    rec.note = f"早停在第 {stop_epoch} 轮触发，第 {epoch} 轮结果忽略"
                 await close_slot(epoch)
                 judged += 1
+                continue
+
+            if rec.state == CANCELLED:
+                await close_slot(epoch)
+                judged += 1
+                continue
+
+            # 该轮报错：按轮号判到即失败；此前最佳轮权重保留但接口拒绝提供
+            if rec.state == ERROR_RETURNED:
+                rec.state = FAILED
+                rec.judged_at = time.time()
+                rec.note = f"验证报错，本次训练失败：{rec.error}"
+                failed_epoch = epoch
+                stop_event.set()
+                session.status = "failed"
+                session.failed_epoch = epoch
+                session.error = f"第 {epoch} 轮验证报错：{rec.error}"
+                session.stop_reason = (
+                    f"第 {epoch} 轮验证报错，本次训练失败，不再发起新轮次"
+                )
+                judged += 1
+                await close_slot(epoch)
                 continue
 
             val_loss = session._results.get(epoch)
             if val_loss is None:
+                # 走到这里只可能是会话级取消：该轮没有有效返回值
                 rec.state = IGNORED
-                rec.note = rec.note or "早停触发，结果忽略"
-                await close_slot(epoch)
-                judged += 1
-                continue
-
-            # 早停触发轮之后的结果一律忽略
-            if stop_trigger_epoch is not None and epoch > stop_trigger_epoch:
-                rec.state = IGNORED
-                rec.note = f"早停在第 {stop_trigger_epoch} 轮触发，结果忽略"
+                rec.note = rec.note or "训练已结束，结果忽略"
                 await close_slot(epoch)
                 judged += 1
                 continue
@@ -317,8 +379,9 @@ async def run_session(
             session.stale_streak = stale
 
             if stale >= PATIENCE:
-                # 连续两轮未刷新：停止发起新一轮；触发轮之后的在途结果将被忽略
-                stop_trigger_epoch = epoch
+                # 连续两轮未刷新：结论立即固化（最佳轮权重随即开放下载），
+                # 停止发起新轮次；触发轮之后的结果/报错一律忽略，不改结论
+                stop_epoch = epoch
                 stop_event.set()
                 session.status = "early_stopped"
                 session.stop_reason = (
@@ -331,7 +394,7 @@ async def run_session(
             outer.create_task(judge())
     except Exception as exc:  # pragma: no cover - 防御性
         session.status = "failed"
-        session.error = repr(exc)
+        session.error = session.error or repr(exc)
         session.finished_at = time.time()
         raise
 

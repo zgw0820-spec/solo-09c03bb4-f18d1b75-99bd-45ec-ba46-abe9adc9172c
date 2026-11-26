@@ -58,9 +58,12 @@
   .b-training   { background: #1d4ed8; color: #dbeafe; }
   .b-validating { background: #7e22ce; color: #f3e8ff; }
   .b-returned   { background: #a16207; color: #fef9c3; }
+  .b-error_returned { background: #b45309; color: #ffedd5; outline: 1px dashed #f87171; }
   .b-judged     { background: #166534; color: #dcfce7; }
+  .b-failed     { background: #991b1b; color: #fee2e2; outline: 1px solid #f87171; }
   .b-ignored, .b-cancelled { background: #7f1d1d; color: #fee2e2; }
   tr.best td { background: rgba(74, 222, 128, .08); }
+  tr.failed td { background: rgba(248, 113, 113, .12); }
   .note { color: var(--muted); font-size: 12px; }
   .status-pill { font-size: 13px; padding: 4px 12px; border-radius: 999px; }
   .s-running { background: #1e3a8a; color: #bfdbfe; }
@@ -96,6 +99,9 @@
         </div>
         <label for="lr">学习率（训练集含误标注，偏大时验证损失会反弹，便于演示早停）</label>
         <input id="lr" type="number" min="0.01" max="20" step="0.05" value="1.1" />
+        <label for="simError">模拟验证报错（指定轮号；留空或 0 表示不模拟）</label>
+        <input id="simError" type="number" min="0" max="100" step="1" value="0" />
+        <div class="note" style="margin-top:4px">报错与验证结果一样按轮号判定：先判到报错则本次训练失败、不再发起新轮次，且拒绝下载权重；先判到早停则结论不受之后报错影响。</div>
         <button id="startBtn">开始训练</button>
         <div id="err" class="err"></div>
       </div>
@@ -105,6 +111,7 @@
         <div class="stat">
           <div class="card"><div class="k">状态</div><div class="v" id="stStatus">-</div></div>
           <div class="card"><div class="k">最低损失轮（并列取最早）</div><div class="v" id="stBest">-</div></div>
+          <div class="card"><div class="k">失败轮号</div><div class="v" id="stFail">-</div></div>
           <div class="card"><div class="k">最低验证损失</div><div class="v" id="stLoss">-</div></div>
           <div class="card"><div class="k">该轮验证准确率</div><div class="v" id="stAcc">-</div></div>
           <div class="card"><div class="k">在途峰值 / 上限</div><div class="v" id="stPeak">-</div></div>
@@ -122,9 +129,11 @@
         <span><span class="badge b-training">训练中</span></span>
         <span><span class="badge b-validating">验证在途</span></span>
         <span><span class="badge b-returned">已返回待判定</span></span>
+        <span><span class="badge b-error_returned">报错待判定</span></span>
         <span><span class="badge b-judged">已判定</span></span>
+        <span><span class="badge b-failed">失败轮</span></span>
         <span><span class="badge b-ignored">忽略/取消</span></span>
-        <span class="note">（乱序时可看到后轮先变“已返回”，但仍等前轮判定）</span>
+        <span class="note">（乱序时可看到后轮先变“已返回/报错待判定”，但仍等前轮判定）</span>
       </div>
       <div class="table-wrap">
         <table>
@@ -146,8 +155,8 @@ let sessionId = null, timer = null;
 
 const STATE_LABEL = {
   pending: "待训练", training: "训练中", validating: "验证在途",
-  returned: "已返回待判定", judged: "已判定",
-  ignored: "忽略", cancelled: "已取消",
+  returned: "已返回待判定", error_returned: "报错待判定", judged: "已判定",
+  failed: "失败轮", ignored: "忽略", cancelled: "已取消",
 };
 const fmt = (x, d = 4) => (x === null || x === undefined) ? "-" : Number(x).toFixed(d);
 
@@ -169,29 +178,38 @@ function render(s) {
       {running:"训练中", early_stopped:"已早停", completed:"已跑完", failed:"失败"}[s.status] || s.status
     }</span>`;
   $("stBest").textContent = s.best_epoch ?? "-";
+  $("stFail").innerHTML = s.failed_epoch != null
+    ? `<span style="color:var(--red)">第 ${s.failed_epoch} 轮</span>`
+    : "-";
   $("stLoss").textContent = fmt(s.best_val_loss);
   $("stAcc").textContent = s.best_accuracy != null ? (s.best_accuracy * 100).toFixed(1) + "%" : "-";
   $("stPeak").textContent = `${s.peak_in_flight} / 3`;
   $("stStale").textContent = `${s.stale_streak} / 2`;
   $("reason").textContent = s.stop_reason || (s.error ? "错误：" + s.error : "");
+  $("reason").classList.toggle("err", s.status === "failed");
 
   const rows = s.epochs.map(e => `
-    <tr class="${s.best_epoch === e.epoch ? "best" : ""}">
-      <td>${e.epoch}${s.best_epoch === e.epoch ? " ⭐" : ""}</td>
+    <tr class="${s.best_epoch === e.epoch ? "best" : ""} ${
+      s.failed_epoch === e.epoch ? "failed" : ""}">
+      <td>${e.epoch}${s.best_epoch === e.epoch ? " ⭐" : ""}${
+        s.failed_epoch === e.epoch ? " ⚠" : ""}</td>
       <td><span class="badge b-${e.state}">${STATE_LABEL[e.state] || e.state}</span></td>
       <td class="num">${fmt(e.train_loss)}</td>
       <td class="num">${fmt(e.val_loss)}</td>
-      <td class="note">${e.note || ""}</td>
+      <td class="note">${e.note || ""}${e.error ? ` <code>${e.error}</code>` : ""}</td>
     </tr>`).join("");
   $("tbody").innerHTML = rows || '<tr><td colspan="5" class="note">暂无轮次</td></tr>';
 
-  const terminalStates = ["judged", "ignored", "cancelled"];
+  const terminalStates = ["judged", "failed", "ignored", "cancelled"];
   const allSettled = s.epochs.every(e => terminalStates.includes(e.state));
   const statusDone = ["early_stopped", "completed", "failed"].includes(s.status);
   const done = statusDone && allSettled;
   $("startBtn").disabled = s.status === "running";
-  // 权重在判定时已保存，状态一结束即可下载，不必等在途任务收尾
-  $("dlBtn").disabled = !(statusDone && s.best_epoch != null);
+  // 失败即作废：即使此前已有最佳轮，也不得下载；其余情况结束后即可下载
+  $("dlBtn").disabled = !(
+    statusDone && s.status !== "failed" && s.best_epoch != null
+  );
+  $("dlBtn").title = s.status === "failed" ? "训练失败，不提供本次权重" : "";
   if (done && timer) { clearInterval(timer); timer = null; }
 }
 
@@ -214,6 +232,12 @@ $("startBtn").onclick = async () => {
     jitter: $("jitter").checked,
     lr: parseFloat($("lr").value),
   };
+  const simErr = parseInt($("simError").value, 10);
+  if (Number.isInteger(simErr) && simErr >= 1) body.simulate_error_epoch = simErr;
+  if (body.simulate_error_epoch && body.simulate_error_epoch > body.max_epochs) {
+    $("err").textContent = "模拟报错轮号不能超过训练轮数上限";
+    return;
+  }
   try {
     const r = await fetch("/api/train", {
       method: "POST", headers: {"Content-Type": "application/json"},
